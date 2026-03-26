@@ -1,0 +1,44 @@
+/* ─────────────────────────────────────────────────────────────
+   FLOWER AND MOON  ·  Global Styles
+   ───────────────────────────────────────────────────────────── */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #080510;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-family: 'Press Start 2P', monospace;
+  overflow: hidden;
+}
+
+#wrapper {
+  position: relative;
+  box-shadow:
+    0 0 60px rgba(208, 112, 160, 0.35),
+    0 0 120px rgba(128, 160, 255, 0.25),
+    0 0 200px rgba(180, 100, 140, 0.15);
+}
+
+canvas {
+  display: block;
+  width: 640px;
+  height: 480px;
+  image-rendering: pixelated;
+  border: 2px solid #4a2550;
+}
+
+#hint {
+  color: #5a3870;
+  font-size: 7px;
+  text-align: center;
+  margin-top: 8px;
+  letter-spacing: 1px;
+}

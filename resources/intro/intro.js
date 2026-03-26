@@ -1,0 +1,864 @@
+// ─────────────────────────────────────────────────────────────
+//  CANVAS SETUP
+// ─────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 640, H = 480, TS = 32;
+
+// ─────────────────────────────────────────────────────────────
+//  SEEDED RNG
+// ─────────────────────────────────────────────────────────────
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = Math.imul(s, 1664525) + 1013904223 | 0;
+    return (s >>> 0) / 0xffffffff;
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MAP  (50 × 30 tiles)
+//  0 = forest (solid)    1 = grass (walkable)
+//  2 = path  (walkable)  4 = flowers (walkable)
+//  5 = clearing (walkable + trigger)
+// ─────────────────────────────────────────────────────────────
+const MW = 50, MH = 30;
+const map = Array.from({ length: MH }, () => new Uint8Array(MW));
+
+const WAYPOINTS = [
+  [3, 15], [7, 14], [11, 13], [15, 15], [19, 13], [23, 16],
+  [27, 14], [31, 16], [35, 14], [39, 15], [43, 14], [46, 15],
+];
+
+function buildMap() {
+  const rng = makeRng(7);
+
+  // Carve grass + path corridor along waypoints
+  for (let i = 0; i < WAYPOINTS.length - 1; i++) {
+    const [x1, y1] = WAYPOINTS[i], [x2, y2] = WAYPOINTS[i + 1];
+    const steps = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
+    for (let t = 0; t <= steps; t++) {
+      const x = Math.round(x1 + (x2 - x1) * t / steps);
+      const y = Math.round(y1 + (y2 - y1) * t / steps);
+      // Wide grass band
+      for (let dy = -5; dy <= 5; dy++) for (let dx = -5; dx <= 5; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx > 0 && nx < MW - 1 && ny > 0 && ny < MH - 1 && map[ny][nx] === 0) map[ny][nx] = 1;
+      }
+      // Narrow dirt path centre
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx > 0 && nx < MW - 1 && ny > 0 && ny < MH - 1) map[ny][nx] = 2;
+      }
+    }
+  }
+
+  // Scatter flower tiles on grass
+  for (let i = 0; i < 60; i++) {
+    const x = 1 + Math.floor(rng() * (MW - 2));
+    const y = 1 + Math.floor(rng() * (MH - 2));
+    if (map[y][x] === 1) map[y][x] = 4;
+  }
+
+  // Clearing area near the end
+  for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+    const nx = 43 + dx, ny = 14 + dy;
+    if (nx > 0 && nx < MW - 1 && ny > 0 && ny < MH - 1) map[ny][nx] = 5;
+  }
+}
+buildMap();
+
+function tileAt(wx, wy) {
+  const c = Math.floor(wx / TS), r = Math.floor(wy / TS);
+  if (c < 0 || c >= MW || r < 0 || r >= MH) return 0;
+  return map[r][c];
+}
+function isSolid(wx, wy) { return tileAt(wx, wy) === 0; }
+
+// ─────────────────────────────────────────────────────────────
+//  PRE-RENDER TILE TEXTURES  (offscreen canvases)
+// ─────────────────────────────────────────────────────────────
+function makeTileCanvas(drawFn) {
+  const oc = document.createElement('canvas');
+  oc.width = oc.height = TS;
+  drawFn(oc.getContext('2d'));
+  return oc;
+}
+
+const TREE_OFFSETS = (() => {
+  const rng = makeRng(17);
+  return Array.from({ length: MW * MH }, () => ({
+    dx: (rng() - 0.5) * 4,
+    dy: (rng() - 0.5) * 4,
+    size: 0.8 + rng() * 0.4,
+    shade: Math.floor(rng() * 3),
+  }));
+})();
+
+function drawForestTile(cx, sx, sy, idx) {
+  cx.fillStyle = '#0e1a0e'; cx.fillRect(sx, sy, TS, TS);
+  const o = TREE_OFFSETS[idx % (MW * MH)];
+  const tx = sx + TS / 2 + o.dx, ty = sy + TS / 2 + o.dy;
+  const sz = (TS / 2 - 3) * o.size;
+  cx.fillStyle = '#3a2a15'; cx.fillRect(tx - 2, ty, 4, TS / 2);
+  const colors = ['#162816', '#1e3c1e', '#2a5020'];
+  cx.fillStyle = colors[o.shade];
+  cx.beginPath(); cx.arc(tx, ty - 2, sz, 0, Math.PI * 2); cx.fill();
+  cx.fillStyle = colors[Math.min(2, o.shade + 1)];
+  cx.beginPath(); cx.arc(tx - 2, ty - sz * 0.4, sz * 0.7, 0, Math.PI * 2); cx.fill();
+}
+
+const grassTile = makeTileCanvas(cx => {
+  cx.fillStyle = '#2d5a27'; cx.fillRect(0, 0, TS, TS);
+  cx.fillStyle = '#3d7035';
+  [[4, 8], [12, 4], [20, 14], [8, 20], [16, 24], [26, 10], [28, 20]].forEach(([x, y]) => {
+    cx.fillRect(x, y, 1, 4); cx.fillRect(x + 2, y + 2, 1, 3);
+  });
+});
+
+const pathTile = makeTileCanvas(cx => {
+  cx.fillStyle = '#7a6848'; cx.fillRect(0, 0, TS, TS);
+  cx.fillStyle = '#6b5a3a';
+  [[2, 2, 14, 10], [18, 6, 10, 10], [4, 18, 13, 10]].forEach(([x, y, w, h]) => cx.fillRect(x, y, w, h));
+  cx.fillStyle = '#8a7a55';
+  [[3, 3, 4, 2], [19, 7, 3, 2], [5, 19, 4, 2]].forEach(([x, y, w, h]) => cx.fillRect(x, y, w, h));
+});
+
+const flowerTile = makeTileCanvas(cx => {
+  cx.fillStyle = '#2d5a27'; cx.fillRect(0, 0, TS, TS);
+  cx.fillStyle = '#3d7035';
+  [[6, 12], [20, 6], [14, 22]].forEach(([x, y]) => { cx.fillRect(x, y, 1, 4); cx.fillRect(x + 2, y + 2, 1, 3); });
+  [['#e8a8c8', 7, 10], ['#c0d0ff', 20, 5], ['#ffe0a0', 13, 22]].forEach(([col, x, y]) => {
+    cx.fillStyle = col; cx.fillRect(x, y, 4, 4);
+    cx.fillStyle = '#fff'; cx.fillRect(x + 1, y + 1, 2, 2);
+  });
+});
+
+const clearingTile = makeTileCanvas(cx => {
+  cx.fillStyle = '#3a6e2f'; cx.fillRect(0, 0, TS, TS);
+  cx.fillStyle = '#4a8038'; cx.fillRect(4, 4, 10, 10); cx.fillRect(18, 16, 8, 8);
+  cx.fillStyle = '#5a9048'; cx.fillRect(6, 6, 4, 4);
+});
+
+function getTileCanvas(type) {
+  switch (type) {
+    case 1: return grassTile;
+    case 2: return pathTile;
+    case 4: return flowerTile;
+    case 5: return clearingTile;
+    default: return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ENTITIES
+// ─────────────────────────────────────────────────────────────
+const player = {
+  x: WAYPOINTS[0][0] * TS + TS / 2,
+  y: WAYPOINTS[0][1] * TS + TS / 2,
+  dir: 'down', moving: false, speed: 2.2,
+};
+
+const girl = {
+  x: 43 * TS + TS / 2,
+  y: 14 * TS + TS / 2,
+  visible: false, running: false, gone: false,
+  dir: 'left', runSpeed: 0, appearTick: 0,
+};
+
+// ─────────────────────────────────────────────────────────────
+//  CAMERA
+// ─────────────────────────────────────────────────────────────
+const cam = { x: 0, y: 0 };
+
+function snapCamera() {
+  cam.x = Math.max(0, Math.min(MW * TS - W, player.x - W / 2));
+  cam.y = Math.max(0, Math.min(MH * TS - H, player.y - H / 2));
+}
+
+function lerpCamera() {
+  const tx = Math.max(0, Math.min(MW * TS - W, player.x - W / 2));
+  const ty = Math.max(0, Math.min(MH * TS - H, player.y - H / 2));
+  cam.x += (tx - cam.x) * 0.1;
+  cam.y += (ty - cam.y) * 0.1;
+}
+snapCamera();
+
+// ─────────────────────────────────────────────────────────────
+//  FIREFLIES
+// ─────────────────────────────────────────────────────────────
+const rngF = makeRng(31);
+const fireflies = Array.from({ length: 35 }, () => ({
+  x: rngF() * MW * TS,
+  y: rngF() * MH * TS,
+  angle: rngF() * Math.PI * 2,
+  speed: 0.25 + rngF() * 0.4,
+  phase: rngF() * Math.PI * 2,
+  drift: (rngF() - 0.5) * 0.6,
+}));
+
+// ─────────────────────────────────────────────────────────────
+//  SPARKLE TRAIL  (guide markers along the path)
+// ─────────────────────────────────────────────────────────────
+const sparkleMarkers = WAYPOINTS.slice(1).map(([x, y]) => ({
+  wx: x * TS + TS / 2,
+  wy: y * TS + TS / 2 - 8,
+  phase: Math.random() * Math.PI * 2,
+}));
+
+// ─────────────────────────────────────────────────────────────
+//  INPUT
+// ─────────────────────────────────────────────────────────────
+const keys = {};
+const _pressedFinal = new Set();
+
+window.addEventListener('keydown', e => {
+  _pressedFinal.add(e.code);
+  keys[e.code] = true;
+  e.preventDefault();
+}, { capture: true });
+
+window.addEventListener('keyup', e => {
+  keys[e.code] = false;
+}, { capture: true });
+
+function confirmPress() {
+  for (const k of ['Space', 'Enter', 'KeyZ', 'KeyX']) {
+    if (_pressedFinal.has(k)) { _pressedFinal.delete(k); return true; }
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DIALOGUE SYSTEM
+// ─────────────────────────────────────────────────────────────
+const DLG = {
+  active: false,
+  lines: [], idx: 0,
+  speaker: '', portrait: '', // 'player' | 'girl' | ''
+  charIdx: 0, charTimer: 0, charSpeed: 2, done: false,
+  callback: null,
+};
+
+function showDlg(lines, speaker, portrait, cb) {
+  DLG.active = true;
+  DLG.lines = lines;
+  DLG.idx = 0;
+  DLG.speaker = speaker;
+  DLG.portrait = portrait;
+  DLG.charIdx = 0;
+  DLG.charTimer = 0;
+  DLG.done = false;
+  DLG.callback = cb || null;
+  STATE = 'DIALOGUE';
+}
+
+function advanceDlg() {
+  if (!DLG.done) {
+    DLG.charIdx = DLG.lines[DLG.idx].length;
+    DLG.done = true;
+  } else {
+    DLG.idx++;
+    if (DLG.idx >= DLG.lines.length) {
+      DLG.active = false;
+      const cb = DLG.callback;
+      DLG.callback = null;
+      if (cb) cb(); else STATE = 'PLAYING';
+    } else {
+      DLG.charIdx = 0;
+      DLG.charTimer = 0;
+      DLG.done = false;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  GAME STATE
+// ─────────────────────────────────────────────────────────────
+let STATE = 'TITLE'; // TITLE | INTRO | PLAYING | DIALOGUE | CUTSCENE | ENDING
+let tick = 0;
+let clearingDone = false;
+let cutscenePhase = 0, cutsceneTimer = 0;
+let endTimer = 0;
+let endingReadyForNext = false; // set true once "~ to be continued ~" has fully appeared
+
+// Intro-specific state
+let introTimer = 0, introPhase = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – PLAYER CHARACTER
+// ─────────────────────────────────────────────────────────────
+function drawPlayer(sx, sy) {
+  const bob = player.moving ? Math.sin(tick * 0.22) * 2 : 0;
+  const legA = player.moving ? Math.sin(tick * 0.22) * 3 : 0;
+  sx = Math.round(sx); sy = Math.round(sy + bob);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(sx, sy + 4, 9, 4, 0, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = '#232d5a';
+  ctx.fillRect(sx - 5, sy - 2, 5, 8 + Math.max(0, legA));
+  ctx.fillRect(sx + 1, sy - 2, 5, 8 - Math.max(0, -legA));
+
+  ctx.fillStyle = '#5a3820';
+  const lb = legA > 0 ? 2 : 0, rb = legA < 0 ? 2 : 0;
+  ctx.fillRect(sx - 6, sy + 5 + lb, 7, 4);
+  ctx.fillRect(sx, sy + 5 + rb, 7, 4);
+
+  ctx.fillStyle = '#2a3d7a'; ctx.fillRect(sx - 7, sy - 16, 14, 16);
+  ctx.fillStyle = '#1e2d60'; ctx.fillRect(sx - 8, sy - 14, 16, 14);
+
+  const armSwing = player.moving ? Math.sin(tick * 0.22 + Math.PI) * 3 : 0;
+  ctx.fillStyle = '#3a4d8a';
+  if (player.dir !== 'left')  ctx.fillRect(sx + 6,  sy - 14 + armSwing, 4, 10);
+  if (player.dir !== 'right') ctx.fillRect(sx - 10, sy - 14 - armSwing, 4, 10);
+
+  ctx.fillStyle = '#8090e0'; ctx.fillRect(sx - 7, sy - 17, 14, 4);
+  ctx.fillStyle = '#f0c8a0'; ctx.fillRect(sx - 6, sy - 26, 12, 11);
+
+  ctx.fillStyle = '#2a1808';
+  ctx.fillRect(sx - 7, sy - 30, 14, 6);
+  ctx.fillRect(sx - 8, sy - 26, 3, 8);
+  if (player.dir === 'right') ctx.fillRect(sx + 5, sy - 26, 3, 6);
+
+  ctx.fillStyle = '#1a1208';
+  if (player.dir !== 'up') {
+    if (player.dir === 'left')       ctx.fillRect(sx - 4, sy - 22, 3, 3);
+    else if (player.dir === 'right') ctx.fillRect(sx + 2, sy - 22, 3, 3);
+    else { ctx.fillRect(sx - 4, sy - 22, 3, 3); ctx.fillRect(sx + 2, sy - 22, 3, 3); }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – GIRL CHARACTER
+// ─────────────────────────────────────────────────────────────
+function drawGirl(sx, sy) {
+  if (!girl.visible) return;
+  const bob = girl.running ? Math.sin(tick * 0.35) * 3 : Math.sin(tick * 0.1) * 1;
+  const legA = girl.running ? Math.sin(tick * 0.35) * 6 : 0;
+  sx = Math.round(sx); sy = Math.round(sy + bob);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath(); ctx.ellipse(sx, sy + 4, 9, 4, 0, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = '#c8a0d8';
+  ctx.beginPath();
+  ctx.moveTo(sx - 10, sy - 2); ctx.lineTo(sx + 11, sy - 2);
+  ctx.lineTo(sx + 14, sy + 10); ctx.lineTo(sx - 13, sy + 10);
+  ctx.closePath(); ctx.fill();
+
+  ctx.fillStyle = '#f0d0c0';
+  ctx.fillRect(sx - 4, sy + 2, 4, 8 + Math.max(0, legA));
+  ctx.fillRect(sx + 1, sy + 2, 4, 8 - Math.max(0, -legA));
+
+  ctx.fillStyle = '#6a4a7a';
+  const la = legA > 0 ? 2 : 0, ra = legA < 0 ? 2 : 0;
+  ctx.fillRect(sx - 5, sy + 9 + la, 6, 4);
+  ctx.fillRect(sx + 1, sy + 9 + ra, 6, 4);
+
+  ctx.fillStyle = '#e0c8f0'; ctx.fillRect(sx - 6, sy - 18, 12, 18);
+
+  const armS = girl.running ? Math.sin(tick * 0.35 + Math.PI) * 5 : 0;
+  ctx.fillStyle = '#f0d0c0';
+  ctx.fillRect(sx - 10, sy - 16 + armS, 4, 10);
+  ctx.fillRect(sx + 7,  sy - 16 - armS, 4, 10);
+
+  ctx.fillStyle = '#a080c0'; ctx.fillRect(sx - 6, sy - 20, 12, 4);
+  ctx.fillStyle = '#f0d0c0'; ctx.fillRect(sx - 7, sy - 32, 14, 13);
+
+  ctx.fillStyle = '#d0d0e8';
+  ctx.fillRect(sx - 8, sy - 36, 16, 8);
+  ctx.fillRect(sx - 9, sy - 30, 3, 20);
+  ctx.fillRect(sx + 7, sy - 30, 3, 18);
+  ctx.fillRect(sx - 9, sy - 14, 3, 8);
+  ctx.fillStyle = '#e8e8f8'; ctx.fillRect(sx - 4, sy - 36, 6, 4);
+
+  ctx.fillStyle = '#4060a0';
+  if (girl.running) {
+    if (girl.dir === 'right') ctx.fillRect(sx + 1, sy - 26, 4, 3);
+    else                      ctx.fillRect(sx - 5, sy - 26, 4, 3);
+  } else {
+    ctx.fillRect(sx - 4, sy - 26, 4, 3);
+    ctx.fillRect(sx + 1, sy - 26, 4, 3);
+  }
+
+  ctx.fillStyle = 'rgba(255,130,130,0.5)';
+  ctx.fillRect(sx - 7, sy - 22, 4, 3);
+  ctx.fillRect(sx + 4, sy - 22, 4, 3);
+
+  if (!girl.running) {
+    ctx.fillStyle = '#8a6a4a'; ctx.fillRect(sx + 11, sy - 34, 3, 44);
+    ctx.fillStyle = '#c0a0ff';
+    ctx.beginPath(); ctx.arc(sx + 12, sy - 36, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath(); ctx.arc(sx + 10, sy - 38, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(180,140,255,0.3)'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(sx + 12, sy - 36, 10, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  if (!girl.running && tick < girl.appearTick + 70) {
+    const p = (tick - girl.appearTick) / 70;
+    const a = Math.sin(p * Math.PI);
+    ctx.fillStyle = `rgba(255,240,80,${a})`;
+    ctx.shadowColor = 'rgba(255,200,0,0.8)'; ctx.shadowBlur = 8;
+    ctx.font = 'bold 14px "Press Start 2P"';
+    ctx.textAlign = 'center';
+    ctx.fillText('!', sx, sy - 46);
+    ctx.shadowBlur = 0; ctx.textAlign = 'left';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – WORLD TILES
+// ─────────────────────────────────────────────────────────────
+function drawWorld() {
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#050c22'); sky.addColorStop(1, '#0d1e16');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  const c0 = Math.floor(cam.x / TS), c1 = Math.min(MW, c0 + Math.ceil(W / TS) + 2);
+  const r0 = Math.floor(cam.y / TS), r1 = Math.min(MH, r0 + Math.ceil(H / TS) + 2);
+
+  for (let r = r0; r < r1; r++) {
+    for (let c = c0; c < c1; c++) {
+      const tile = map[r][c];
+      const sx = Math.floor(c * TS - cam.x), sy = Math.floor(r * TS - cam.y);
+      if (tile === 0) {
+        drawForestTile(ctx, sx, sy, r * MW + c);
+      } else {
+        const tc = getTileCanvas(tile);
+        if (tc) ctx.drawImage(tc, sx, sy);
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – ATMOSPHERIC EFFECTS
+// ─────────────────────────────────────────────────────────────
+function drawFireflies() {
+  for (const f of fireflies) {
+    const sx = f.x - cam.x, sy = f.y - cam.y;
+    if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+    const b = 0.35 + Math.sin(tick * f.speed * 0.06 + f.phase) * 0.35 + 0.3;
+    ctx.fillStyle = `rgba(160,255,120,${b * 0.9})`;
+    ctx.shadowColor = 'rgba(120,255,80,0.7)'; ctx.shadowBlur = 8;
+    ctx.beginPath(); ctx.arc(sx, sy, 2, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+
+function updateFireflies() {
+  for (const f of fireflies) {
+    f.x += Math.cos(f.angle) * f.speed * 0.5;
+    f.y += Math.sin(f.angle) * f.speed * 0.3 + f.drift * 0.08;
+    f.angle += 0.015;
+    if (f.x < 0) f.x = MW * TS; if (f.x > MW * TS) f.x = 0;
+    if (f.y < 0) f.y = MH * TS; if (f.y > MH * TS) f.y = 0;
+  }
+}
+
+function drawSparkles() {
+  if (clearingDone || STATE === 'CUTSCENE' || STATE === 'ENDING') return;
+  const nearest = sparkleMarkers.filter(m => m.wx > player.x).slice(0, 3);
+  for (const m of nearest) {
+    const sx = m.wx - cam.x, sy = m.wy - cam.y;
+    if (sx < 0 || sx > W || sy < 0 || sy > H) continue;
+    const b = 0.5 + Math.sin(tick * 0.08 + m.phase) * 0.3;
+    const y2 = sy + Math.sin(tick * 0.06 + m.phase) * 3;
+    ctx.fillStyle = `rgba(200,180,255,${b})`;
+    ctx.shadowColor = 'rgba(180,140,255,0.8)'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(sx, y2, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    for (let i = 0; i < 4; i++) {
+      const ang = i * Math.PI / 2 + tick * 0.03;
+      const r = 6 + Math.sin(tick * 0.08 + m.phase + i) * 2;
+      ctx.fillStyle = `rgba(220,200,255,${b * 0.4})`;
+      ctx.beginPath(); ctx.arc(sx + Math.cos(ang) * r, y2 + Math.sin(ang) * r, 1.2, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+function drawMist() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0,   'rgba(80,100,160,0.18)');
+  g.addColorStop(0.5, 'rgba(80,100,160,0.06)');
+  g.addColorStop(1,   'rgba(40,70,100,0.22)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 4; i++) {
+    const mx = ((tick * 0.25 + i * 220) % (W + 300)) - 150;
+    const my = 160 + i * 60 + Math.sin(tick * 0.008 + i) * 25;
+    const mg = ctx.createRadialGradient(mx, my, 0, mx, my, 130);
+    mg.addColorStop(0, 'rgba(160,180,240,0.09)');
+    mg.addColorStop(1, 'rgba(160,180,240,0)');
+    ctx.fillStyle = mg; ctx.fillRect(0, 0, W, H);
+  }
+}
+
+function drawVignette() {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.9);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,15,0.75)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – DIALOGUE BOX  (Octopath style)
+// ─────────────────────────────────────────────────────────────
+function drawDialogueBox() {
+  if (!DLG.active) return;
+
+  DLG.charTimer++;
+  if (!DLG.done && DLG.charTimer >= DLG.charSpeed) {
+    DLG.charTimer = 0;
+    if (DLG.charIdx < DLG.lines[DLG.idx].length) DLG.charIdx++;
+    else DLG.done = true;
+  }
+
+  const BX = 10, BY = H - 130, BW = W - 20, BH = 120;
+  ctx.fillStyle = 'rgba(6,6,18,0.95)'; ctx.fillRect(BX, BY, BW, BH);
+  ctx.strokeStyle = '#5a5090'; ctx.lineWidth = 2; ctx.strokeRect(BX, BY, BW, BH);
+  ctx.strokeStyle = '#3a3060'; ctx.lineWidth = 1; ctx.strokeRect(BX + 4, BY + 4, BW - 8, BH - 8);
+  ctx.fillStyle = 'rgba(120,100,200,0.15)'; ctx.fillRect(BX + 6, BY + 6, BW - 12, 2);
+
+  if (DLG.speaker) {
+    const nw = ctx.measureText(DLG.speaker).width * 0.5 + 20;
+    ctx.fillStyle = 'rgba(6,6,18,0.95)'; ctx.fillRect(BX + 16, BY - 18, nw, 20);
+    ctx.strokeStyle = '#5a5090'; ctx.lineWidth = 2; ctx.strokeRect(BX + 16, BY - 18, nw, 20);
+    ctx.fillStyle = '#a0b0ff'; ctx.font = '8px "Press Start 2P"';
+    ctx.fillText(DLG.speaker, BX + 24, BY - 4);
+  }
+
+  const hasPortrait = DLG.portrait === 'girl' || DLG.portrait === 'player';
+  if (DLG.portrait === 'girl')   drawPortraitGirl(BX + BW - 72, BY + 12, 58, 58);
+  if (DLG.portrait === 'player') drawPortraitPlayer(BX + BW - 72, BY + 12, 58, 58);
+
+  const text = DLG.lines[DLG.idx].substring(0, DLG.charIdx);
+  ctx.fillStyle = '#d8e0ff'; ctx.font = '9px "Press Start 2P"';
+  const maxW = hasPortrait ? BW - 105 : BW - 40;
+  const words = text.split(' ');
+  let line = '', lineY = BY + 34;
+  for (const w of words) {
+    const test = line + (line ? ' ' : '') + w;
+    if (ctx.measureText(test).width > maxW && line) {
+      ctx.fillText(line, BX + 20, lineY); line = w; lineY += 20;
+    } else line = test;
+  }
+  if (line) ctx.fillText(line, BX + 20, lineY);
+
+  if (DLG.done && Math.floor(tick / 18) % 2 === 0) {
+    ctx.fillStyle = '#8080d0'; ctx.font = '10px "Press Start 2P"';
+    ctx.fillText('▼', BX + BW - 30, BY + BH - 14);
+  }
+}
+
+function drawPortraitPlayer(x, y, w, h) {
+  ctx.fillStyle = '#0e1830'; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#3a3860'; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#f0c8a0'; ctx.fillRect(x + 19, y + 14, 20, 18);
+  ctx.fillStyle = '#2a1808'; ctx.fillRect(x + 17, y + 11, 24, 8);
+  ctx.fillRect(x + 17, y + 13, 4, 10);
+  ctx.fillStyle = '#1a1208'; ctx.fillRect(x + 22, y + 20, 5, 5); ctx.fillRect(x + 31, y + 20, 5, 5);
+  ctx.fillStyle = '#2a3d7a'; ctx.fillRect(x + 16, y + 30, 26, 18);
+  ctx.fillStyle = '#8090e0'; ctx.fillRect(x + 16, y + 28, 26, 5);
+}
+
+function drawPortraitGirl(x, y, w, h) {
+  ctx.fillStyle = '#0e0e20'; ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#3a3060'; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#f0d0c0'; ctx.fillRect(x + 18, y + 14, 22, 18);
+  ctx.fillStyle = '#d0d0e8';
+  ctx.fillRect(x + 16, y + 10, 26, 8);
+  ctx.fillRect(x + 16, y + 12, 5, 24);
+  ctx.fillRect(x + 37, y + 12, 5, 22);
+  ctx.fillStyle = '#4060a0'; ctx.fillRect(x + 22, y + 20, 5, 5); ctx.fillRect(x + 31, y + 20, 5, 5);
+  ctx.fillStyle = 'rgba(255,130,130,0.5)'; ctx.fillRect(x + 17, y + 27, 6, 3); ctx.fillRect(x + 35, y + 27, 6, 3);
+  ctx.fillStyle = '#e0c8f0'; ctx.fillRect(x + 15, y + 30, 28, 16);
+  ctx.fillStyle = '#a080c0'; ctx.fillRect(x + 15, y + 28, 28, 5);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – TITLE SCREEN
+// ─────────────────────────────────────────────────────────────
+const titleRng = makeRng(55);
+const stars = Array.from({ length: 120 }, () => ({
+  x: titleRng() * W,
+  y: titleRng() * H * 0.75,
+  b: titleRng(),
+}));
+
+function drawTitle() {
+  ctx.fillStyle = '#05050f'; ctx.fillRect(0, 0, W, H);
+
+  for (const s of stars) {
+    const b = 0.3 + Math.sin(tick * 0.018 + s.b * 10) * 0.35 + 0.35;
+    ctx.fillStyle = `rgba(190,200,255,${b * 0.7})`;
+    ctx.fillRect(s.x, s.y, s.b > 0.7 ? 2 : 1, s.b > 0.7 ? 2 : 1);
+  }
+
+  ctx.fillStyle = 'rgba(220,220,255,0.7)';
+  ctx.beginPath(); ctx.arc(W * 0.8, H * 0.18, 22, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#05050f';
+  ctx.beginPath(); ctx.arc(W * 0.8 + 8, H * 0.18 - 5, 18, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = '#0a130a';
+  for (let i = 0; i < 18; i++) {
+    const tx = i * 42 - 8, th = 70 + ((i * 17) % 5) * 22;
+    ctx.beginPath(); ctx.moveTo(tx, H); ctx.lineTo(tx + 18, H - th); ctx.lineTo(tx + 36, H); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(tx + 6, H); ctx.lineTo(tx + 20, H - th * 0.7); ctx.lineTo(tx + 34, H); ctx.closePath(); ctx.fill();
+  }
+
+  ctx.textAlign = 'center';
+  ctx.shadowColor = 'rgba(100,80,220,0.8)'; ctx.shadowBlur = 25;
+  ctx.fillStyle = '#c8d4ff'; ctx.font = '18px "Press Start 2P"';
+  ctx.fillText('LOST IN THE', W / 2, H / 2 - 40);
+  ctx.fillStyle = '#d0c0ff'; ctx.font = '16px "Press Start 2P"';
+  ctx.fillText('ANCIENT FOREST', W / 2, H / 2 - 14);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = '#5060a0'; ctx.font = '7px "Press Start 2P"';
+  ctx.fillText('a frieren-inspired short adventure', W / 2, H / 2 + 18);
+
+  if (Math.floor(tick / 28) % 2 === 0) {
+    ctx.fillStyle = '#8090d0'; ctx.font = '8px "Press Start 2P"';
+    ctx.fillText('— PRESS SPACE TO BEGIN —', W / 2, H / 2 + 60);
+  }
+
+  ctx.fillStyle = '#2a2858'; ctx.font = '6px "Press Start 2P"';
+  ctx.fillText('use  WASD  to explore  ·  SPACE to continue', W / 2, H - 20);
+  ctx.textAlign = 'left';
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – INTRO CUTSCENE
+// ─────────────────────────────────────────────────────────────
+function drawIntro() {
+  ctx.fillStyle = '#05050f'; ctx.fillRect(0, 0, W, H);
+
+  if (introPhase >= 3) {
+    const a = Math.min(1, introTimer / 70);
+    ctx.globalAlpha = a; drawWorld(); ctx.globalAlpha = 1;
+    ctx.fillStyle = `rgba(5,5,15,${1 - a})`; ctx.fillRect(0, 0, W, H);
+    return;
+  }
+  if (introPhase === 0) {
+    const a = 1 - introTimer / 60;
+    ctx.fillStyle = `rgba(5,5,15,${a})`; ctx.fillRect(0, 0, W, H);
+  }
+  if (introPhase === 1) {
+    const p = introTimer / 130;
+    const sx = W * 0.75 - p * W * 0.5, sy = -30 + p * (H * 0.65);
+    for (let i = 0; i < 24; i++) {
+      const tp = i / 24;
+      ctx.fillStyle = `rgba(200,180,255,${(1 - tp) * 0.7})`;
+      ctx.fillRect(sx + tp * 55 - 1, sy + tp * 60, 2, 2);
+    }
+    ctx.fillStyle = '#fff'; ctx.shadowColor = '#c0a0ff'; ctx.shadowBlur = 16;
+    ctx.fillRect(sx - 3, sy - 3, 6, 6); ctx.shadowBlur = 0;
+  }
+  if (introPhase === 2) {
+    const fa = Math.max(0, 1 - introTimer / 35);
+    ctx.fillStyle = `rgba(200,180,255,${fa})`; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = `rgba(180,160,255,${fa * 0.5})`; ctx.lineWidth = 2;
+    for (let r = 0; r < 5; r++) {
+      ctx.beginPath();
+      ctx.arc(W * 0.38, H * 0.62, (introTimer * 9) + r * 28, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – ENDING SCREEN
+// ─────────────────────────────────────────────────────────────
+function drawEnding() {
+  drawWorld();
+  const px = Math.floor(player.x - cam.x), py = Math.floor(player.y - cam.y);
+  drawPlayer(px, py);
+  drawMist(); drawFireflies(); drawVignette();
+  endTimer++;
+
+  const fade = Math.min(1, endTimer / 100);
+  ctx.fillStyle = `rgba(5,5,15,${fade * 0.88})`; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  if (endTimer > 80)  { const a = Math.min(1, (endTimer - 80)  / 50);  ctx.globalAlpha = a; ctx.fillStyle = '#c0ccff'; ctx.font = '9px "Press Start 2P"'; ctx.fillText('Somewhere in the ancient forest,', W / 2, H / 2 - 50); ctx.fillText('a boy stood alone — bewildered.',   W / 2, H / 2 - 28); ctx.globalAlpha = 1; }
+  if (endTimer > 180) { const a = Math.min(1, (endTimer - 180) / 60);  ctx.globalAlpha = a; ctx.fillStyle = '#9090d8'; ctx.font = '8px "Press Start 2P"'; ctx.fillText("He didn't even know her name.",     W / 2, H / 2 + 10); ctx.globalAlpha = 1; }
+  if (endTimer > 290) { const a = Math.min(1, (endTimer - 290) / 60);  ctx.globalAlpha = a; ctx.fillStyle = '#7878c0'; ctx.font = '8px "Press Start 2P"'; ctx.fillText('But somehow, he wanted to find her.', W / 2, H / 2 + 34); ctx.globalAlpha = 1; }
+  if (endTimer > 420) { const a = Math.min(1, (endTimer - 420) / 70);  ctx.globalAlpha = a; ctx.fillStyle = '#d070a0'; ctx.font = '18px serif'; ctx.fillText('♡', W / 2, H / 2 + 70); ctx.globalAlpha = 1; }
+  if (endTimer > 540) {
+    const a = Math.min(1, (endTimer - 540) / 60);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#5050a0'; ctx.font = '7px "Press Start 2P"';
+    ctx.fillText('~ to be continued ~', W / 2, H / 2 + 100);
+    ctx.globalAlpha = 1;
+    // Once the text is fully visible, mark that we're ready for next chapter
+    if (a >= 1 && !endingReadyForNext) endingReadyForNext = true;
+  }
+
+  // Show "press to continue" hint once ready
+  if (endingReadyForNext) {
+    const blink = Math.floor(tick / 22) % 2 === 0;
+    if (blink) {
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = '#8090d0'; ctx.font = '7px "Press Start 2P"';
+      ctx.fillText('— SPACE · ENTER to continue —', W / 2, H / 2 + 126);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  ctx.textAlign = 'left';
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DRAW – HUD
+// ─────────────────────────────────────────────────────────────
+function drawHUD() {
+  if (STATE !== 'PLAYING' || clearingDone) return;
+  const distToClear = Math.hypot(player.x - 43 * TS, player.y - 14 * TS);
+  if (distToClear < 12 * TS) {
+    const a = Math.max(0, (12 * TS - distToClear) / (12 * TS)) * 0.7;
+    ctx.fillStyle = `rgba(160,150,220,${a * 0.8 * (0.6 + Math.sin(tick * 0.05) * 0.4)})`;
+    ctx.font = '7px "Press Start 2P"';
+    ctx.textAlign = 'center';
+    ctx.fillText('something stirs nearby...', W / 2, 22);
+    ctx.textAlign = 'left';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  UPDATE – PLAYER MOVEMENT
+// ─────────────────────────────────────────────────────────────
+function updatePlayer() {
+  let dx = 0, dy = 0;
+  if (keys['ArrowLeft']  || keys['KeyA']) { dx = -1; player.dir = 'left'; }
+  if (keys['ArrowRight'] || keys['KeyD']) { dx =  1; player.dir = 'right'; }
+  if (keys['ArrowUp']    || keys['KeyW']) { dy = -1; player.dir = 'up'; }
+  if (keys['ArrowDown']  || keys['KeyS']) { dy =  1; player.dir = 'down'; }
+  if (dx && dy) { dx *= 0.707; dy *= 0.707; }
+  player.moving = !!(dx || dy);
+
+  const spd = player.speed, m = 12;
+  const nx = player.x + dx * spd;
+  if (!isSolid(nx + m, player.y) && !isSolid(nx - m, player.y)) player.x = nx;
+  const ny = player.y + dy * spd;
+  if (!isSolid(player.x + m, ny) && !isSolid(player.x - m, ny)) player.y = ny;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  UPDATE – CUTSCENE TRIGGER
+// ─────────────────────────────────────────────────────────────
+function startCutscene() {
+  clearingDone = true;
+  STATE = 'CUTSCENE';
+  cutscenePhase = 0; cutsceneTimer = 0;
+  girl.visible = true; girl.appearTick = tick;
+  girl.running = false; girl.gone = false;
+}
+
+function checkClearingTrigger() {
+  if (clearingDone) return;
+  const col = Math.floor(player.x / TS), row = Math.floor(player.y / TS);
+  if (col >= 39 && col <= 47 && row >= 10 && row <= 18) startCutscene();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MAIN GAME LOOP
+// ─────────────────────────────────────────────────────────────
+function loop() {
+  const confirm = confirmPress();
+  tick++;
+
+  // ── UPDATE ──────────────────────────────────────────────────
+  switch (STATE) {
+
+    case 'TITLE':
+      if (confirm) { STATE = 'INTRO'; introTimer = 0; introPhase = 0; }
+      break;
+
+    case 'INTRO':
+      introTimer++;
+      if (introPhase === 0 && introTimer > 55)  { introPhase = 1; introTimer = 0; }
+      if (introPhase === 1 && introTimer > 125)  { introPhase = 2; introTimer = 0; }
+      if (introPhase === 2 && introTimer > 45)   { introPhase = 3; introTimer = 0; }
+      if (introPhase === 3 && introTimer > 75) {
+        snapCamera();
+        introPhase = 4;
+        showDlg(
+          ['...', '...where... am I?', 'The air smells like pine and something much older.', 'Ancient magic, maybe.', 'I should look around.'],
+          '', 'player', () => { STATE = 'PLAYING'; }
+        );
+      }
+      if (confirm && introPhase < 3) { introPhase = 3; introTimer = 75; }
+      break;
+
+    case 'PLAYING':
+      updatePlayer(); lerpCamera(); updateFireflies(); checkClearingTrigger();
+      break;
+
+    case 'DIALOGUE':
+      if (confirm) advanceDlg();
+      lerpCamera(); updateFireflies();
+      if (girl.running && !girl.gone) {
+        girl.x += girl.runSpeed;
+        girl.runSpeed = Math.min(6, girl.runSpeed + 0.4);
+        if (girl.x > MW * TS) girl.gone = true;
+      }
+      break;
+
+    case 'CUTSCENE':
+      cutsceneTimer++;
+      lerpCamera(); updateFireflies();
+      if (cutscenePhase === 0 && cutsceneTimer > 75) {
+        cutscenePhase = 1;
+        showDlg(['Oh—', '...', "You're cute!", '...bye~'], '???', 'girl', () => {
+          cutscenePhase = 2; cutsceneTimer = 0;
+          girl.running = true; girl.dir = 'right';
+          STATE = 'CUTSCENE';
+        });
+      }
+      if (cutscenePhase === 2) {
+        girl.x += girl.runSpeed;
+        girl.runSpeed = Math.min(6, girl.runSpeed + 0.35);
+        if (girl.x > MW * TS) girl.gone = true;
+        if (cutsceneTimer > 85) {
+          cutscenePhase = 3; cutsceneTimer = 0;
+          showDlg(
+            ['...', 'She... just sprinted away.', "I didn't even get to say anything.", 'Just... "bye~"?', 'What was that?'],
+            '', 'player', () => { STATE = 'ENDING'; }
+          );
+        }
+      }
+      if (STATE === 'DIALOGUE' && confirm) advanceDlg();
+      break;
+
+    case 'ENDING':
+      lerpCamera(); updateFireflies(); endTimer++;
+      // After "~ to be continued ~" appears, listen for confirm to go to next chapter
+      if (endingReadyForNext && confirm) {
+        window.location.href = 'fnm.html';
+      }
+      break;
+  }
+
+  // ── RENDER ──────────────────────────────────────────────────
+  ctx.clearRect(0, 0, W, H);
+
+  switch (STATE) {
+    case 'TITLE':   drawTitle();  break;
+    case 'INTRO':   drawIntro();  break;
+    case 'ENDING':  drawEnding(); break;
+    default:
+      drawWorld();
+      if (girl.visible && !girl.gone) drawGirl(Math.floor(girl.x - cam.x), Math.floor(girl.y - cam.y));
+      drawPlayer(Math.floor(player.x - cam.x), Math.floor(player.y - cam.y));
+      drawSparkles();
+      drawMist(); drawFireflies(); drawVignette();
+      drawHUD();
+      if (DLG.active) drawDialogueBox();
+      break;
+  }
+
+  requestAnimationFrame(loop);
+}
+
+loop();
